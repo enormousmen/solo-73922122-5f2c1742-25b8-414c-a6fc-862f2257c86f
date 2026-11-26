@@ -9,9 +9,12 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .controller import EchoController, EchoControllerError
+from .coordination import ConflictError as DrillConflict
+from .coordination import SelfTestManager
 from .probes import run_tcp_probe
 from .selftest import run_self_test
 
@@ -61,6 +64,8 @@ async def lifespan(app: FastAPI):
         nofile_limit=NOFILE_LIMIT,
     )
     app.state.controller = controller
+    # One authority for self-test/sample-open conflicts and interruptions.
+    app.state.self_test_manager = SelfTestManager()
     try:
         controller.start()
     except Exception as exc:  # noqa: BLE001 - keep API up so /healthz can report
@@ -91,6 +96,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(DrillConflict)
+async def drill_conflict_handler(_request: Request, exc: DrillConflict) -> JSONResponse:
+    """All drill coordination conflicts are HTTP 409."""
+    return JSONResponse(status_code=409, content=exc.to_dict())
+
+
+def self_test_manager(request: Request) -> SelfTestManager:
+    manager = getattr(request.app.state, "self_test_manager", None)
+    if manager is None:
+        # Lazily create one for callers/tests that did not run the lifespan.
+        manager = SelfTestManager()
+        request.app.state.self_test_manager = manager
+    return manager
 
 
 def controller_or_503(request: Request) -> EchoController:
@@ -155,6 +175,7 @@ def status(request: Request) -> dict[str, Any]:
     worker_status["host_echo_endpoint"] = (
         f"{ADVERTISED_ECHO_HOST}:{ADVERTISED_ECHO_PORT}"
     )
+    worker_status["self_test"] = self_test_manager(request).snapshot()
     return worker_status
 
 
@@ -182,16 +203,33 @@ def emfile_metric(request: Request) -> dict[str, Any]:
 def exhaust(request: Request) -> dict[str, Any]:
     """Open sample log files until open(2) reports EMFILE."""
     controller = controller_or_503(request)
-    return worker_call(controller, "exhaust")
+    manager = self_test_manager(request)
+    try:
+        # Manual action: blocked with 409 while a self-test is live.  The
+        # "manual" owner tag distinguishes these from self-test descriptors.
+        return manager.manual_open_command(
+            controller, "exhaust", {"owner": "manual"}
+        )
+    except EchoControllerError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/drill/release", tags=["drill"])
 @app.post("/api/drill/release", include_in_schema=False)
 @app.post("/api/close", include_in_schema=False)
 def release(request: Request) -> dict[str, Any]:
-    """Close all API-opened sample descriptors; the listener resumes service."""
+    """Close all API-opened sample descriptors; the listener resumes service.
+
+    Allowed during a self-test: it immediately interrupts the run and closes
+    every currently retained descriptor.  New manual samples may be opened as
+    soon as this response returns.
+    """
     controller = controller_or_503(request)
-    return worker_call(controller, "release_samples")
+    manager = self_test_manager(request)
+    try:
+        return manager.manual_release(controller)
+    except EchoControllerError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/sample-files/open", tags=["sample-files"])
@@ -202,40 +240,89 @@ def open_sample_files(body: OpenSamplesRequest, request: Request) -> dict[str, A
             detail="Provide count and/or set fill_to_limit=true.",
         )
     controller = controller_or_503(request)
+    manager = self_test_manager(request)
     payload = body.model_dump(exclude_none=True)
-    return worker_call(controller, "open_samples", **payload)
+    payload["owner"] = "manual"
+    try:
+        return manager.manual_open_command(controller, "open_samples", payload)
+    except EchoControllerError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.delete("/api/v1/sample-files", tags=["sample-files"])
 def close_sample_files(request: Request) -> dict[str, Any]:
     controller = controller_or_503(request)
-    return worker_call(controller, "release_samples")
+    manager = self_test_manager(request)
+    try:
+        return manager.manual_release(controller)
+    except EchoControllerError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/drill/restart", tags=["drill"])
 def restart(request: Request) -> dict[str, Any]:
     controller: EchoController = request.app.state.controller
+    manager = self_test_manager(request)
     try:
-        ready = controller.restart()
+        result = manager.manual_restart(controller)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=repr(exc)) from exc
-    return {"ok": True, "ready": ready}
+    return {"ok": True, **result}
+
+
+@app.get("/api/v1/drill/self-test", tags=["drill"])
+def drill_self_test_status(request: Request) -> dict[str, Any]:
+    """Current/last self-test run state, including an aborted report."""
+    return self_test_manager(request).snapshot()
 
 
 @app.post("/api/v1/drill/self-test", tags=["drill"])
 @app.post("/api/self-test", include_in_schema=False)
-def drill_self_test(request: Request) -> dict[str, Any]:
-    """Run the complete old-conn/EMFILE/EOF/no-spin/recovery scenario in-process."""
+def drill_self_test(request: Request) -> Any:
+    """Run the complete old-conn/EMFILE/EOF/no-spin/recovery scenario in-process.
+
+    Returns 409 before starting when manual sample descriptors are open or
+    another run is live.  If an operator release/restart interrupts this run,
+    the response is 200 with ``state="aborted"``/``aborted=true`` (the report
+    is also available from ``GET /api/v1/drill/self-test``).  Genuine
+    uninterrupted failures keep the historical ``500 {"detail": report}``
+    shape.
+    """
     controller = controller_or_503(request)
-    report = run_self_test(
-        controller,
-        host=PROBE_HOST,
-        port=ECHO_PORT,
-        cpu_sample_seconds=0.5,
-    )
-    if not report.get("ok"):
-        raise HTTPException(status_code=500, detail=report)
-    return report
+    manager = self_test_manager(request)
+    # Raises DrillConflict -> global handler -> HTTP 409.  A worker/control
+    # pipe failure while reading the precondition status becomes a 502.
+    try:
+        run = manager.begin(controller)
+    except EchoControllerError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    terminal_state = "failed"
+    try:
+        report = run_self_test(
+            controller,
+            host=PROBE_HOST,
+            port=ECHO_PORT,
+            cpu_sample_seconds=0.5,
+            manager=manager,
+            run=run,
+        )
+        terminal_state = str(report.get("state") or "failed")
+
+        if report.get("aborted") or terminal_state == "aborted":
+            # The run was accepted and ended in an expected abort state; the
+            # spec asks it to "report" the abort rather than mandating an error
+            # status.  Return 200 with the report at top level and under
+            # detail/report aliases so every common client shape can read it.
+            content = dict(report)
+            content["detail"] = report
+            content["report"] = report
+            return JSONResponse(status_code=200, content=content)
+
+        if not report.get("ok"):
+            raise HTTPException(status_code=500, detail=report)
+        return report
+    finally:
+        manager.finish(run, terminal_state)
 
 
 @app.get("/api/v1/drill/accept-loop-check", tags=["drill"])

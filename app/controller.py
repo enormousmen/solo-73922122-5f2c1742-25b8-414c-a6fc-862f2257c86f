@@ -48,6 +48,10 @@ class EchoController:
         self._request_id = 0
         self.ready: dict[str, Any] | None = None
         self.start_error: str | None = None
+        # Bumped on every successful (re)start.  Long-running flows such as the
+        # self-test capture it so they can detect a manual restart and refuse
+        # to issue late commands to the new worker generation.
+        self.generation = 0
 
     @property
     def pid(self) -> int | None:
@@ -104,6 +108,7 @@ class EchoController:
                     raise EchoControllerError(f"unexpected ready message: {ready}")
                 self.ready = ready
                 self.start_error = None
+                self.generation += 1
                 return ready
             except Exception as exc:
                 self.start_error = f"{type(exc).__name__}: {exc}"
@@ -115,14 +120,19 @@ class EchoController:
 
     def _read_stdout(self) -> None:
         proc = self._proc
+        # Capture this generation's queue: after a restart self._lines points
+        # at a fresh queue and a dying old reader must not put its EOF
+        # sentinel into it (which could make the next ready/response wait see
+        # a spurious "worker exited").
+        lines = self._lines
         if proc is None or proc.stdout is None:
-            self._lines.put(None)
+            lines.put(None)
             return
         try:
             for line in proc.stdout:
-                self._lines.put(line)
+                lines.put(line)
         finally:
-            self._lines.put(None)
+            lines.put(None)
 
     def request(
         self,

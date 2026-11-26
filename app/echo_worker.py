@@ -214,7 +214,7 @@ class EchoWorker:
             path.write_bytes(line[: max(0, size_bytes)])
         return path
 
-    def _open_one_sample(self, *, size_bytes: int) -> dict[str, Any]:
+    def _open_one_sample(self, *, size_bytes: int, owner: str = "manual") -> dict[str, Any]:
         index = len(self.sample_handles) + 1
         path = self._write_sample_file(index, size_bytes)
         # Serialize descriptor allocation with EMFILE rescue handling.
@@ -226,6 +226,7 @@ class EchoWorker:
                 "index": index,
                 "path": str(path),
                 "fd": fd,
+                "owner": owner,
                 "size_bytes": path.stat().st_size,
             }
             self.sample_records.append(record)
@@ -237,6 +238,7 @@ class EchoWorker:
         count: int | None = None,
         fill_to_limit: bool = False,
         file_size_bytes: int | None = None,
+        owner: str = "manual",
     ) -> dict[str, Any]:
         size = (
             self.sample_content_bytes
@@ -249,7 +251,9 @@ class EchoWorker:
         if count is not None:
             for _ in range(max(0, int(count))):
                 try:
-                    opened.append(self._open_one_sample(size_bytes=size))
+                    opened.append(
+                        self._open_one_sample(size_bytes=size, owner=owner)
+                    )
                 except OSError as exc:
                     self.fill_error = {
                         "operation": "open",
@@ -267,7 +271,9 @@ class EchoWorker:
             safety_cap = int(soft_limit) + 8
             while len(self.sample_handles) < safety_cap:
                 try:
-                    opened.append(self._open_one_sample(size_bytes=size))
+                    opened.append(
+                        self._open_one_sample(size_bytes=size, owner=owner)
+                    )
                 except OSError as exc:
                     self.fill_error = {
                         "operation": "open",
@@ -289,27 +295,48 @@ class EchoWorker:
             "fd_table_full": fd_note is not None and "EMFILE" in fd_note,
         }
 
-    def _close_samples(self) -> dict[str, Any]:
-        closed = len(self.sample_handles)
+    def _close_samples(self, owner: str | None = None) -> dict[str, Any]:
+        """Close sample handles.
+
+        With ``owner=None`` every sample handle is closed (operator release).
+        With an owner tag, only descriptors opened under that tag are closed;
+        this is how an uninterrupted self-test cleans up exactly its own FDs.
+        """
         errors: list[str] = []
+        closed_records: list[dict[str, Any]] = []
+        kept_handles: list[Any] = []
+        kept_records: list[dict[str, Any]] = []
         with self.fd_lock:
-            for handle in self.sample_handles:
+            # sample_handles/sample_records are appended in lockstep.
+            for handle, record in zip(self.sample_handles, self.sample_records):
+                if owner is not None and record.get("owner", "manual") != owner:
+                    kept_handles.append(handle)
+                    kept_records.append(record)
+                    continue
                 try:
                     handle.close()
                 except OSError as exc:
                     errors.append(str(exc))
-            self.sample_handles.clear()
-            records = self.sample_records
-            self.sample_records = []
-            self.fill_error = None
-        return {"closed_sample_files": closed, "errors": errors, "closed_paths": [r["path"] for r in records]}
+                closed_records.append(record)
+            self.sample_handles = kept_handles
+            self.sample_records = kept_records
+            if owner is None:
+                self.fill_error = None
+        return {
+            "closed_sample_files": len(closed_records),
+            "errors": errors,
+            "closed_paths": [r["path"] for r in closed_records],
+            "owner_filter": owner,
+            "open_sample_files": len(self.sample_handles),
+        }
 
-    def release_samples(self) -> dict[str, Any]:
-        result = self._close_samples()
+    def release_samples(self, owner: str | None = None) -> dict[str, Any]:
+        result = self._close_samples(owner=owner)
+        remaining = result["open_sample_files"]
         fd_count, note = count_open_fds()
         result.update(
             {
-                "open_sample_files": 0,
+                "open_sample_files": remaining,
                 "open_fd_count": fd_count,
                 "fd_count_note": note,
                 "listener_fd": self.server.fileno() if self.server is not None else None,
@@ -484,6 +511,10 @@ class EchoWorker:
             records = list(self.sample_records[-20:])
             fill_error = self.fill_error
             rescue_fd = self.rescue_fd
+            sample_owners: dict[str, int] = {}
+            for record in self.sample_records:
+                owner = str(record.get("owner", "manual"))
+                sample_owners[owner] = sample_owners.get(owner, 0) + 1
         return {
             "ok": True,
             "type": "status",
@@ -504,6 +535,7 @@ class EchoWorker:
             "accept_thread_tid": self.accept_thread_tid,
             "sample_dir": str(self.sample_dir),
             "open_sample_files": sample_count,
+            "sample_owners": sample_owners,
             "sample_files_tail": records,
             "fill_error": fill_error,
             "open_fd_count": fd_count,
@@ -572,6 +604,7 @@ def main(argv: list[str] | None = None) -> int:
                         count=request.get("count"),
                         fill_to_limit=bool(request.get("fill_to_limit", False)),
                         file_size_bytes=request.get("file_size_bytes"),
+                        owner=str(request.get("owner") or "manual")[:64],
                     ),
                 }
             elif command == "exhaust":
@@ -581,13 +614,17 @@ def main(argv: list[str] | None = None) -> int:
                     **worker.open_samples(
                         fill_to_limit=True,
                         file_size_bytes=request.get("file_size_bytes"),
+                        owner=str(request.get("owner") or "manual")[:64],
                     ),
                 }
             elif command == "release_samples":
+                owner = request.get("owner")
                 result = {
                     "ok": True,
                     "type": "release_samples",
-                    **worker.release_samples(),
+                    **worker.release_samples(
+                        owner=None if owner is None else str(owner)[:128]
+                    ),
                 }
             else:
                 result = {"ok": False, "error": f"unknown command: {command!r}"}

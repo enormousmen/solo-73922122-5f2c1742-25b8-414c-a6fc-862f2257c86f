@@ -64,3 +64,51 @@ DELETE {{api}}/api/v1/sample-files
 
 ### Optional restart of the managed echo process
 POST {{api}}/api/v1/drill/restart
+
+### =====================================================================
+### Concurrency / interruption rules (issue the self-test first; it runs
+### ~0.5-1 s, so send the following requests from another tab/curl while
+### it is in flight. scripts/demo-interrupt-requests.sh automates this.)
+### =====================================================================
+
+### A. Inspect current/last self-test run (always 200; includes report)
+GET {{api}}/api/v1/drill/self-test
+
+### B. 409 when a self-test is already running (send while another runs)
+POST {{api}}/api/v1/drill/self-test
+
+### C. 409 while a self-test is running: open N sample descriptors
+POST {{api}}/api/v1/sample-files/open
+Content-Type: application/json
+
+{
+  "count": 1
+}
+
+### D. 409 while a self-test is running: exhaust is also blocked
+POST {{api}}/api/v1/drill/exhaust
+
+### E. Status stays queryable during a self-test (200, see self_test.active)
+GET {{api}}/api/v1/status
+
+### F. Interrupt the run by releasing all samples.
+###    The in-flight self-test response then reports state=aborted.
+###    Returns self_test_interrupted=<run_id>.
+POST {{api}}/api/v1/drill/release
+
+### G. Immediately after F this is allowed again (no wait for the old run)
+POST {{api}}/api/v1/sample-files/open
+Content-Type: application/json
+
+{
+  "count": 3
+}
+
+### H. Or interrupt by restarting the worker (new generation); late steps
+###    of the old run cannot touch the restarted worker.
+POST {{api}}/api/v1/drill/restart
+
+### I. Pre-existing manual samples also make self-test start fail with 409
+###    code=manual_samples_open. Clean up afterwards:
+DELETE {{api}}/api/v1/sample-files
+

@@ -101,10 +101,46 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/probe \
 | `GET` | `/api/v1/metrics/emfile` | 查询真实 accept EMFILE 累计次数 |
 | `GET` | `/api/v1/drill/accept-loop-check?seconds=1` | 通过 `/proc` 采样接入线程 CPU/状态 |
 | `POST` | `/api/v1/probe` | 发起一条 TCP 探测并分类 `eof`/`reset`/`echo`/`timeout` |
-| `POST` | `/api/v1/drill/self-test` | 服务端执行完整旧连接/EMFILE/EOF/非忙等/恢复断言 |
-| `POST` | `/api/v1/drill/restart` | 重启受管回显进程并重置其进程内计数 |
+| `POST` | `/api/v1/drill/exhaust` | 打开样例日志直到 `open(2)` 返回 `EMFILE`；自检运行中返回 **409** |
+| `POST` | `/api/v1/drill/release` | 关闭全部 API 打开的样例日志 FD；会立即打断运行中的自检 |
+| `POST` | `/api/v1/sample-files/open` | 打开指定数量，或 `{"fill_to_limit": true}`；自检运行中返回 **409** |
+| `DELETE` | `/api/v1/sample-files` | 同 release |
+| `GET` | `/api/v1/metrics/emfile` | 查询真实 accept EMFILE 累计次数 |
+| `GET` | `/api/v1/drill/accept-loop-check?seconds=1` | 通过 `/proc` 采样接入线程 CPU/状态 |
+| `POST` | `/api/v1/probe` | 发起一条 TCP 探测并分类 `eof`/`reset`/`echo`/`timeout` |
+| `GET` | `/api/v1/drill/self-test` | 查询当前/最近一次自检状态与（含 aborted 的）报告 |
+| `POST` | `/api/v1/drill/self-test` | 服务端执行完整旧连接/EMFILE/EOF/非忙等/恢复断言；已有手动样例或自检并发时 **409** |
+| `POST` | `/api/v1/drill/restart` | 重启受管回显进程并重置其进程内计数；会立即打断运行中的自检 |
 
-为方便手工调用，也提供无版本别名：`/api/status`、`/api/emfile-count`、`/api/fill`、`/api/close`、`/api/probe`。
+为方便手工调用，也提供无版本别名：`/api/status`、`/api/emfile-count`、`/api/fill`、`/api/close`、`/api/probe`、`/api/self-test`、`/api/drill/exhaust`、`/api/drill/release`。
+
+## 并发、409 与“打断自检”语义
+
+为修复“自检失败收尾误关值班员手动样例 FD、旧自检关掉释放/重启后新开的样例”的问题，所有样例操作与自检现在由 `app/coordination.py` 中的 `SelfTestManager` 统一仲裁：
+
+1. **发起自检的前置条件**：回显进程当前 `open_sample_files == 0`（没有任何遗留/手动样例），且没有另一个未结束的自检。否则 `POST /api/v1/drill/self-test` 返回 **409**：
+   - `code=self_test_running`：已有自检在跑；
+   - `code=self_test_stopping`：上一个自检已被打断、正在收尾（稍后重试即可）；
+   - `code=manual_samples_open`：已有手动样例，响应带 `open_sample_files` 与 `sample_owners`。被拒绝的自检不会关闭这些样例。
+2. **自检进行中**：`POST .../self-test`、`POST /drill/exhaust`、`POST /sample-files/open`（含 `fill_to_limit`）一律 **409**（`code=self_test_running`）；`GET /api/v1/status`、`GET /api/v1/drill/self-test`、指标与探测不受影响，仍可查询/调用。
+3. **手动 release / DELETE 样例 / restart 始终允许且立即执行**：它们先把当前自检标记为 `abort`，再执行关闭全部样例或重启。CPU 采样的 0.5 秒 `sleep` 与 TCP 探测不持有仲裁锁，因此 release/restart **不需要等探测或整个自检结束**（实测 release 约 3–4 ms、restart 约 0.1 s 即返回）。响应中的 `self_test_interrupted` 给出被打断的 `run_id`。
+4. **操作完成后可立即开新样例**：一旦 abort 已置位，即使旧自检线程尚未完全退出，手动开样例也会被放行。
+5. **被打断的自检报告中止，迟到步骤不得再碰样例**：每个自检有唯一 `run_id` 与 `owner=selftest:<run_id>` 标签，并记录启动时的 worker `generation`。自检的每个 worker 命令/CPU 采样都经过“检查 abort/generation + 发命令”的原子门控；release/restart 持同一把锁完成“置 abort + 操作”，消除 check-then-act 竞争。打断后旧自检的后续步骤（含收尾 release）不会再到达 worker。原自检 HTTP 响应为 `200`，报告含 `"state":"aborted"`、`"aborted":true`、`"abort_reason"`，并同时在 `detail`/`report` 字段里放了同一份报告以兼容不同解析方式；事后也可用 `GET /api/v1/drill/self-test` 查到该中止报告。
+6. **未被打断的自检，无论成败，只关自己的描述符**：自检 exhaust 打开的每个样例都带 `owner=selftest:<run_id>`，成功收尾与失败 `except` 收尾都调用带 `{"owner": ...}` 过滤的 `release_samples`，worker 只关闭同标签 FD。无 `owner` 的 release（值班员手动 release/DELETE）仍是“关闭全部”。`/api/v1/status` 新增 `sample_owners` 计数可核对归属。
+
+### 手动 API 演示打断自检
+
+```bash
+# 可断言的一键场景套件（仅标准库；覆盖下面所有 409/abort/FD 存活断言）
+python3 scripts/demo_interrupt.py
+# 指向其它地址：
+python3 scripts/demo_interrupt.py --api-base http://127.0.0.1:8000
+
+# 纯 curl 版，完整演示“后台跑自检 -> 409 矩阵 -> release/restart 打断 -> 新样例存活”
+./scripts/demo-interrupt-requests.sh
+```
+
+JetBrains/VS Code REST Client 的同名流程已加入 [`requests/demo-requests.http`](requests/demo-requests.http) 的 “Concurrency / interruption rules” 分段（A–I）。
 
 ## 实现行为
 
@@ -137,32 +173,52 @@ python3 tests/worker_smoke.py
 
 它会使用随机本地端口、`RLIMIT_NOFILE=32` 启动工作进程，并自动执行上述全部核心 TCP/FD 断言。若环境中有 pytest，也可运行 `pytest tests/test_emfile_worker.py`。
 
-## 交付前实测结果
+## 本次修正了什么（自检与值班员操作的并发/归属）
 
-本次交付环境有 Python 3.11.2 与 GCC，但没有 Docker/Podman CLI 或容器 socket；因此实际试跑采用等价的本地 Uvicorn + 受管 echo worker。FastAPI 依赖被临时安装到 `/tmp/pydeps`，未写入系统 Python。
+- 新增 `app/coordination.py`：`SelfTestManager` 作为进程内唯一仲裁者，提供开始前置检查、运行登记表、abort 事件、worker `generation` 栅栏，以及“检查 + 发 worker 命令”原子门控。
+- `app/main.py`：lifespan 挂载 manager；新增 409 处理器；`POST /self-test` 在有手动样例或并发自检时返回 409；exhaust/open 在自检存活期返回 409；release/DELETE/restart 先打断自检再执行；新增 `GET /api/v1/drill/self-test`；`/api/v1/status` 增加 `self_test` 快照，worker status 增加 `sample_owners`。
+- `app/selftest.py`：每次运行有 `run_id/owner`；所有 worker 命令与 CPU 采样走门控；识别 `SelfTestAborted` 并输出 `state=aborted/aborted=true/abort_reason`；被打断后不再发任何 open/release；未打断的成功与失败收尾都只发带 `{"owner": ...}` 归属过滤的 release。
+- `app/echo_worker.py`：样例记录新增 `owner`（默认 `manual`，旧协议不受影响）；`release_samples(owner=...)` 只关同标签 FD，不带 owner 仍关闭全部；status 增加 `sample_owners`；修正归属过滤 release 响应里 `open_sample_files` 原来硬编码为 0 的问题。
+- `app/controller.py`：新增每次成功启动递增的 `generation`；stdout 读线程按代捕获队列，避免旧 reader 的 EOF 哨兵在 restart 后误入新队列。
+- 新增回归/演示：`tests/test_selftest_coordination.py`（7 个用例，含真实 FD 归属隔离）、`scripts/demo_interrupt.py`（可断言全套场景）、`scripts/demo-interrupt-requests.sh`（纯 curl 手动打断演示），并扩充 `requests/demo-requests.http`。
 
-已通过的关键结果：
+## 交付前实测结果（本轮，Python 3.11.2 / Linux）
 
-- `python3 tests/worker_smoke.py`：`WORKER SELFTEST PASSED`
-  - `open_sample_files=26`（含一条旧连接时），`open_fd_count=32`，`fd_table_full=true`
-  - 旧连接故障前/故障中回显均一致
-  - 新探测：`EOF after 0.1 ms`（连接建立后计时，远小于 1 秒）
-  - 单次探测后 `emfile_total=1`、`reaped_after_emfile_total=1`
-  - 空闲故障 1 秒内接入线程 CPU：`0.0 ms`
-  - release 关闭 26 个样例 FD 后，新连接回显成功
-- `python3 scripts/demo.py` 对真实 FastAPI/Uvicorn 试跑：`DEMO PASSED`
-- `POST /api/v1/drill/self-test` 试跑：`ok=true`，六项检查全部为 `true`；探测 EOF 约 `0.184 ms`，EMFILE 计数为 1，CPU 采样为 `0.0s`，恢复回显匹配
-- 额外突发测试：10 条并发探测均在约 2 ms 内收到 EOF，EMFILE/回收计数各增加 10，释放后回显正常
+本沙箱没有 Docker/Podman CLI 或容器 socket；用 bootstrap pip 把 `fastapi==0.165.0`、`uvicorn==0.54.0`、`httpx/pytest` 装到 `/tmp/pydeps`（未写入系统 Python、未改 `requirements.txt`），以等价的本地 Uvicorn + 受管 `echo_worker.py`（`DRILL_NOFILE_LIMIT=32`）实测。
+
+- `python3 -m py_compile app/*.py tests/*.py scripts/demo_interrupt.py`：通过。
+- `PYTHONPATH=/tmp/pydeps python3 -m pytest tests/ -q`：**8 passed**（原 `worker_smoke` 适配用例 + 7 个新增仲裁/归属用例）。
+- `python3 tests/worker_smoke.py`：`WORKER SELFTEST PASSED`；`open_sample_files=26`、`open_fd_count=32`、`fd_table_full=true`；新探测 `EOF after 0.1 ms`；空闲故障 1 秒接入线程 CPU `0.0 ms`；release 26 个样例后新连接回显成功。
+- 真实 HTTP 关键场景（`python3 scripts/demo_interrupt.py`，在 8000/8001/8002 多个等价实例上连续多轮）：**ALL INTERRUPTION SCENARIOS PASSED**，覆盖
+  - 已有 2 个手动样例时 self-test → **409 `manual_samples_open`**，且被拒后仍为 2 个样例；
+  - 自检运行中：第二个 self-test、`sample-files/open`、exhaust 均 **409**，`GET /status` 200 且 `self_test.active=true`；
+  - release 打断：自检报告 `state=aborted, aborted=true`，原因 `operator called release_samples`，响应带匹配的 `self_test_interrupted=<run_id>`；release 返回后立刻 open 3 个成功，等待 0.8 s 后仍为 `open_sample_files=3 {'manual': 3}`，回显正常；
+  - restart 打断：新 pid/新 generation，自检原因 `operator restarted the echo worker`，重启后立刻 open 的 2 个样例在旧自检结束后仍存活，回显正常；
+  - 无打断自检：200、`ok=true`、六项 check 全 true、约 0.52 s，结束后 `open_sample_files=0`。
+- `bash scripts/demo-interrupt-requests.sh`（纯 curl）：退出码 0；清晰打印预期 409、两种 aborted 报告以及 `SURVIVAL OK` / `post-restart samples survived ... = 2`。
+- 并发与延迟加测（临时脚本，未入库）：6 线程栅栏同时 `POST /self-test` 恰好 **1 个 200（ok=true）+ 5 个 409**；自检 CPU 采样窗口中调 release **约 3.6 ms** 返回并成功打断，运行中 restart 约 **94 ms** 返回；连续 8 次“自检不同阶段 + restart”压力全部正确 abort、`/healthz` 与 `/status` 始终 200，穿插的完整自检也全部 ok；最终实例访问日志无 5xx / Traceback。
+- `python3 scripts/demo.py --api-base ... --echo-port ...`：`DEMO PASSED`（原宿主机 TCP 时序断言无回归）。
+- `docker-compose.yml` 用 PyYAML 解析通过（服务 `drill`，端口 `8000:8000`/`9000:9000`）；本轮**未改** `docker-compose.yml`/`Dockerfile`，新增 `app/coordination.py` 与脚本会被现有 `COPY app ./app`、`COPY scripts ./scripts` 自动带入镜像。
+
+### 基线探测实测（原有行为未回归）
+
 - API 探测实测：
   - 不发送数据：`outcome=eof`，`elapsed_after_connect_ms≈0.168`
   - 先发送 1 字节：`outcome=reset`，`errno=104 (ECONNRESET)`，约 `0.26 ms`
   - 恢复后：`outcome=echo`，`echo_matches=true`
 - release 响应中原监听描述符保持不变：`listener_fd=3`
-- `docker-compose.yml` 已用 PyYAML 解析，服务、端口和环境变量结构有效；Python 文件全部通过 `py_compile`
+- 更早的突发测试：10 条并发探测均在约 2 ms 内收到 EOF，EMFILE/回收计数各增加 10，释放后回显正常。
 
 ## 未完成项与边界
 
-- 本沙箱未安装 Docker/Podman，因此没有实际执行 `docker compose up --build`；已验证 Compose YAML、Dockerfile 依赖安装项和等价本地进程链路。首次在有 Docker 的环境运行时仍建议执行一次 `docker compose up --build` 和 `python3 scripts/demo.py`。
+- 本沙箱未安装 Docker/Podman、也没有可用容器 socket，因此**没有实际执行 `docker compose up --build`**；已验证 Compose YAML、Dockerfile 依赖项与等价本地 Uvicorn + worker 全链路。首次在有 Docker 的环境建议执行：
+  ```bash
+  docker compose up --build
+  ./scripts/demo-interrupt-requests.sh
+  python3 scripts/demo_interrupt.py
+  python3 scripts/demo.py
+  ```
+- 被打断自检的“原请求最终响应”规范只要求“报告中止”、未规定状态码；当前返回 **200** 且报告含 `aborted=true / state=aborted`，并在 `detail`、`report` 字段放置同一报告以兼容不同解析；事后统一可用 `GET /api/v1/drill/self-test` 读取。若约定中止也要 4xx，可在 `app/main.py` 的 self-test 端点把该分支改为 `JSONResponse(status_code=409, ...)`，其余仲裁逻辑不变。
 - 这是本地演练工具，未配置认证、TLS 或多副本；不应暴露到不可信网络。
 - EMFILE 计数是工作进程生命周期内的累计值；调用 `/api/v1/drill/restart` 会重置。
-- 样例日志文件默认保留在 Docker 命名卷 `drill_sample-logs` 中作为现场证据；如需清理可 `docker compose down -v`。
+- 样例日志文件默认保留在 Docker 命名卷 `drill-sample-logs` 中作为现场证据；如需清理可 `docker compose down -v`。
