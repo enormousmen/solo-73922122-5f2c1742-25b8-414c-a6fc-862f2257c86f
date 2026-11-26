@@ -1,0 +1,28 @@
+services:
+  drill:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fd-emfile-drill:latest
+    container_name: fd-emfile-drill
+    init: true
+    ports:
+      - "8000:8000"   # FastAPI drill API and /docs
+      - "9000:9000"   # raw TCP echo process
+    environment:
+      # The echo worker lowers its own RLIMIT_NOFILE to this value before it
+      # opens the listener and reserved descriptor.
+      DRILL_NOFILE_LIMIT: "32"
+      DRILL_ECHO_BIND_HOST: "0.0.0.0"
+      DRILL_ECHO_PORT: "9000"
+      DRILL_PROBE_HOST: "127.0.0.1"
+      DRILL_ECHO_ADVERTISED_HOST: "127.0.0.1"
+      DRILL_ECHO_ADVERTISED_PORT: "9000"
+      DRILL_SAMPLE_DIR: "/var/lib/drill/sample-logs"
+    volumes:
+      - drill-sample-logs:/var/lib/drill/sample-logs
+    restart: unless-stopped
+    stop_grace_period: 5s
+
+volumes:
+  drill-sample-logs:

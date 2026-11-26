@@ -1,0 +1,66 @@
+### FD/EMFILE drill demo requests
+### Start with: docker compose up --build
+### Use scripts/demo.py for the full timing/echo assertions.
+
+@api = http://127.0.0.1:8000
+
+### 1. API and echo process health
+GET {{api}}/healthz
+
+### 2. Initial status and RLIMIT_NOFILE
+GET {{api}}/api/v1/status
+
+### 3. Initial real accept(2) EMFILE counter
+GET {{api}}/api/v1/metrics/emfile
+
+### 3b. Optional one-request server-side full scenario
+POST {{api}}/api/v1/drill/self-test
+
+### 4. Fill the echo process descriptor table with retained sample logs
+POST {{api}}/api/v1/drill/exhaust
+
+### 5. While fault is active: old TCP connections still echo.
+###    See scripts/demo.py for opening and verifying the long-lived connection.
+
+### 6. API-side one-new-connection probe: expect outcome "eof" or "reset"
+POST {{api}}/api/v1/probe
+Content-Type: application/json
+
+{
+  "send_payload": false,
+  "timeout_seconds": 1.0
+}
+
+### 7. Query actual EMFILE count during the fault
+GET {{api}}/api/v1/metrics/emfile
+
+### 8. Confirm accept thread is not burning CPU while idle in select()
+GET {{api}}/api/v1/drill/accept-loop-check?seconds=1.0
+
+### 9. Close sample log descriptors through the API
+POST {{api}}/api/v1/drill/release
+
+### 10. New connection must now echo
+POST {{api}}/api/v1/probe
+Content-Type: application/json
+
+{
+  "payload": "recovery-echo",
+  "send_payload": true,
+  "expect_echo": true,
+  "timeout_seconds": 2.0
+}
+
+### Optional: open exactly N additional sample descriptors
+POST {{api}}/api/v1/sample-files/open
+Content-Type: application/json
+
+{
+  "count": 5
+}
+
+### Optional REST-style close
+DELETE {{api}}/api/v1/sample-files
+
+### Optional restart of the managed echo process
+POST {{api}}/api/v1/drill/restart
